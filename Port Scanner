@@ -1,0 +1,206 @@
+import socket
+import threading
+import json
+import re
+import ipaddress
+import argparse
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+COMMON_PORTS = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+    80: "HTTP", 110: "POP3", 139: "NetBIOS", 143: "IMAP", 443: "HTTPS",
+    445: "SMB", 1433: "MSSQL", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL",
+    8080: "HTTP-Proxy", 8443: "HTTPS-Alt"
+}
+
+scan_results = {}
+print_lock = threading.Lock()
+
+def ping_host(ip, timeout=1.0):
+    for test_port in [80, 443, 22, 445, 135]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            res = s.connect_ex((ip, test_port))
+            s.close()
+            if res == 0:
+                return True
+        except:
+            pass
+    return False
+
+def grab_banner(s, port, target_host="localhost"):
+    try:
+        if port in [80, 443, 8080]:
+            probe = f"HEAD / HTTP/1.1\r\nHost: {target_host}\r\nUser-Agent: Scanner/1.0\r\n\r\n".encode()
+        elif port == 25:
+            probe = b"EHLO test.com\r\n"
+        elif port == 110:
+            probe = b"QUIT\r\n"
+        else:
+            probe = b"\r\n"
+
+        s.send(probe)
+        banner = s.recv(1024).decode(errors='ignore').strip()
+        first_line = banner.split('\n')[0] if banner else "Banner yok"
+        return first_line[:70]
+    except:
+        return "Banner alinamadi"
+
+def analyze_vulnerabilities(port, service, banner):
+    risks = []
+    detected_ver = "Bilinmiyor"
+    
+    ver_match = re.search(r'([a-zA-Z0-9_\-]+[/\s][0-9]+\.[0-9]+(?:\.[0-9]+)?)', banner)
+    if ver_match:
+        detected_ver = ver_match.group(1)
+
+    banner_lower = banner.lower()
+
+    if port in [23, 21]:
+        risks.append("[ORTA] Güvensiz/Şifrelenmemiş protokol kullanımı.")
+    if port == 445:
+        risks.append("[BILGI] SMB Servisi açık. MS17-010 güncelliğini kontrol edin.")
+    
+    if "vsftpd 2.3.4" in banner_lower:
+        risks.append("[KRITIK] vsFTPd 2.3.4 Backdoor zafiyeti tespit edildi (CVE-2011-2523)!")
+    if "openssh" in banner_lower:
+        m = re.search(r'openssh[_\s]([0-9]+\.[0-9]+)', banner_lower)
+        if m and float(m.group(1)) < 7.5:
+            risks.append(f"[YUKSEK] Eski OpenSSH sürümü ({m.group(1)}).")
+    if "apache/2.2" in banner_lower or "apache/2.0" in banner_lower:
+        risks.append("[YUKSEK] Apache EOL (Desteklenmeyen) sürüm tespiti.")
+    if "openssl/1.0.1" in banner_lower:
+        risks.append("[KRITIK] Olası Heartbleed Zafiyeti!")
+
+    if not risks:
+        risks.append("[GUVENLI] Bilinen bir kritik zafiyet kalıbı eşleşmedi.")
+
+    return detected_ver, risks
+
+def scan_port(target_ip, port, timeout, target_host):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        result = s.connect_ex((target_ip, port))
+        
+        if result == 0:
+            service = COMMON_PORTS.get(port, "Bilinmeyen")
+            banner = grab_banner(s, port, target_host)
+            version, risks = analyze_vulnerabilities(port, service, banner)
+            
+            with print_lock:
+                print(f"\n[+] [{target_ip}] Port {port:<5} | AÇIK | Servis: {service:<12}")
+                print(f"    |- Banner   : {banner}")
+                print(f"    |- Versiyon : {version}")
+                for msg in risks:
+                    print(f"    |- Risk     : {msg}")
+                
+                if target_ip not in scan_results:
+                    scan_results[target_ip] = []
+                
+                scan_results[target_ip].append({
+                    "port": port,
+                    "service": service,
+                    "banner": banner,
+                    "version": version,
+                    "risks": risks
+                })
+        s.close()
+    except Exception:
+        pass
+
+def save_output(output_name):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_file = f"{output_name}_{timestamp}.json"
+    txt_file = f"{output_name}_{timestamp}.txt"
+    
+    with open(json_file, "w", encoding="utf-8") as jf:
+        json.dump(scan_results, jf, indent=4, ensure_ascii=False)
+
+    with open(txt_file, "w", encoding="utf-8") as tf:
+        tf.write(f"=== TARAMA RAPORU ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ===\n\n")
+        for ip, ports in scan_results.items():
+            tf.write(f"[*] HEDEF IP: {ip}\n")
+            for p in ports:
+                tf.write(f"  |- Port {p['port']} ({p['service']}) - Versiyon: {p['version']}\n")
+                tf.write(f"     Banner: {p['banner']}\n")
+                tf.write("     Riskler:\n")
+                for r in p['risks']:
+                    tf.write(f"       * {r}\n")
+            tf.write("-" * 60 + "\n")
+
+    print(f"\n[+] Raporlar kaydedildi:")
+    print(f"    |- JSON : {json_file}")
+    print(f"    |- TXT  : {txt_file}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Çok İzlekli Port Tarayıcı ve Analiz Aracı")
+    parser.add_argument("-t", "--target", help="Hedef IP, Domain veya Subnet (Örn: 127.0.0.1 veya 192.168.1.0/24)")
+    parser.add_argument("-p", "--ports", default="1-1024", help="Port Aralığı (Örn: 1-1024 veya 80). Varsayılan: 1-1024")
+    parser.add_argument("-w", "--workers", type=int, default=150, help="Thread sayısı. Varsayılan: 150")
+    parser.add_argument("--timeout", type=float, default=1.0, help="Soket zaman aşımı. Varsayılan: 1.0")
+    parser.add_argument("-o", "--output", default="scan_result", help="Çıktı dosya adı. Varsayılan: scan_result")
+    parser.add_argument("--ping-sweep", action="store_true", help="Taramadan önce aktif host tespiti yap")
+
+    args = parser.parse_args()
+
+    if not args.target:
+        args.target = input("Taranacak hedefi girin (Örn: 127.0.0.1, example.com veya 192.168.1.0/24): ").strip()
+        if not args.target:
+            print("[!] Hedef girilmedi, program kapatılıyor.")
+            sys.exit(1)
+
+    try:
+        if "-" in args.ports:
+            start_port, end_port = map(int, args.ports.split("-"))
+        else:
+            start_port = end_port = int(args.ports)
+    except ValueError:
+        print("[!] Geçersiz port aralığı!")
+        sys.exit(1)
+
+    try:
+        if "/" in args.target:
+            raw_ips = [str(ip) for ip in ipaddress.ip_network(args.target, strict=False).hosts()]
+        else:
+            raw_ips = [socket.gethostbyname(args.target)]
+    except Exception as e:
+        print(f"[!] Hedef çözümleme hatası: {e}")
+        sys.exit(1)
+
+    active_ips = []
+    if args.ping_sweep and len(raw_ips) > 1:
+        print(f"[*] Ping Sweep başlatılıyor ({len(raw_ips)} IP)...")
+        with ThreadPoolExecutor(max_workers=50) as ex:
+            futures = {ex.submit(ping_host, ip): ip for ip in raw_ips}
+            for fut in futures:
+                if fut.result():
+                    active_ips.append(futures[fut])
+        print(f"[+] {len(active_ips)} aktif cihaz bulundu.")
+    else:
+        active_ips = raw_ips
+
+    print("=" * 60)
+    print(f" HEDEF          : {args.target} ({len(active_ips)} Aktif IP)")
+    print(f" PORT ARALIĞI   : {start_port} - {end_port}")
+    print(f" THREAD SAYISI  : {args.workers}")
+    print(f" ZAMAN AŞIMI    : {args.timeout}s")
+    print(f" BAŞLANGIÇ      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        for ip in active_ips:
+            for port in range(start_port, end_port + 1):
+                executor.submit(scan_port, ip, port, args.timeout, args.target)
+
+    print("\n" + "-" * 60)
+    print("Tarama tamamlandı.")
+    
+    if scan_results:
+        save_output(args.output)
+
+if __name__ == "__main__":
+    main()
